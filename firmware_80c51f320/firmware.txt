@@ -1,0 +1,241 @@
+#include <C8051F320.h>
+
+// =============== DEFINICIONES ===============
+typedef unsigned char u8;
+typedef unsigned int u16;
+
+// =============== CONSTANTES ===============
+#define NUM_ZONES 8
+#define DEBOUNCE_TIME 50  // 50 ciclos de ~1ms = 50ms (aumentado)
+
+// =============== VARIABLES GLOBALES ===============
+u8 zones_enabled = 0xFF;          // Máscara de zonas habilitadas
+u8 zone_stable_state[8];          // Estado estable de cada zona (después de debounce)
+u8 zone_last_raw_state[8];        // Último estado crudo de cada zona
+u8 zone_debounce_counter[8];      // Contadores de debounce
+u8 alarm_active = 0;              // Alarma general activa
+u8 rx_char;                       // Carácter recibido
+u8 rx_index = 0;                  // Índice del buffer
+u8 rx_buffer[12];                 // Buffer de recepción
+u16 system_time_ms = 0;           // Tiempo del sistema en ms
+
+// =============== FUNCIONES BÁSICAS ===============
+void UART0_Write(u8 dato) {
+    while(!TI0);
+    TI0 = 0;
+    SBUF0 = dato;
+}
+
+void Send_String(u8 *str) {
+    while(*str) UART0_Write(*str++);
+}
+
+void Send_Number(u8 num) {
+    u8 digits[3];
+    u8 i = 0;
+    u8 j;
+    
+    if(num == 0) {
+        UART0_Write('0');
+        return;
+    }
+    
+    while(num > 0) {
+        digits[i++] = (num % 10) + '0';
+        num /= 10;
+    }
+    
+    for(j = i; j > 0; j--) {
+        UART0_Write(digits[j-1]);
+    }
+}
+
+// =============== INICIALIZACIÓN ===============
+void Init_System(void) {
+    u8 i;  // Declarar variable al inicio de la función
+    u8 initial_state;
+    
+    // Configuración básica
+    PCA0MD &= ~0x40;      // Desactivar WDT
+    OSCICN |= 0x03;       // Reloj 12MHz
+    
+    // Configuración de puertos
+    P1MDIN = 0xFF;        // P1 como entradas digitales
+    P0MDOUT |= 0x10;      // P0.4 (TX) como push-pull
+    
+    // Crossbar
+    XBR0 = 0x01;          // Habilitar UART0
+    XBR1 = 0x40;          // Habilitar Crossbar
+    
+    // CONFIGURACIÓN UART (SEGÚN TU CONFIGURACIÓN EXACTA)
+    SCON0 = 0x10;         // UART0 en modo -bit, recepción habilitada
+    TMOD &= 0x0F;         // Limpia configuración de Timer 1
+    TMOD |= 0x20;         // Timer 1 en Modo 2 (8-bit auto-reload)
+    
+    // Modificaciones para 9600 baudios @ 12MHz
+    CKCON &= ~0x0B;       // Limpia bits 3, 1 y 0
+    CKCON |= 0x01;        // Establece SCA1-SCA0 en 01 (SYSCLK/4)
+    
+    TH1 = 0x64;           // Valor de recarga para 9600 baudios
+    TR1 = 1;              // Arranca el Timer 1
+    TI0 = 1;              // Indica que la UART está lista para transmitir
+    
+    // Inicializar variables
+    initial_state = P1;
+    alarm_active = 0;
+    zones_enabled = 0xFF;
+    
+    for(i = 0; i < 8; i++) {
+        zone_stable_state[i] = (initial_state >> i) & 0x01;
+        zone_last_raw_state[i] = zone_stable_state[i];
+        zone_debounce_counter[i] = 0;
+    }
+}
+
+// =============== DELAY DE 1ms PRECISO ===============
+void Delay_1ms(void) {
+    u16 j;
+    for(j = 0; j < 120; j++);  // Ajustado para 1ms @ 12MHz
+}
+
+// =============== DETECCIÓN DE ZONAS MEJORADA ===============
+void Check_Zones(void) {
+    u8 current_raw_state, zone_current_state, i;
+    
+    current_raw_state = P1;
+    
+    // Verificar cada zona individualmente
+    for(i = 0; i < 8; i++) {
+        zone_current_state = (current_raw_state >> i) & 0x01;
+        
+        // Si el estado crudo cambió desde la última lectura
+        if(zone_current_state != zone_last_raw_state[i]) {
+            // Reiniciar contador de debounce
+            zone_debounce_counter[i] = DEBOUNCE_TIME;
+            zone_last_raw_state[i] = zone_current_state;
+        }
+        
+        // Si hay un debounce en progreso
+        if(zone_debounce_counter[i] > 0) {
+            zone_debounce_counter[i]--;
+            
+            // Si el debounce terminó
+            if(zone_debounce_counter[i] == 0) {
+                // Verificar si el estado estable es diferente al estado actual
+                if(zone_current_state != zone_stable_state[i]) {
+                    // ACTUALIZAR ESTADO ESTABLE
+                    zone_stable_state[i] = zone_current_state;
+                    
+                    // ENVIAR EVENTO SOLO UNA VEZ
+                    Send_String("Z");
+                    UART0_Write(i + '0');
+                    Send_String(":");
+                    UART0_Write(zone_current_state + '0');
+                    Send_String("\r\n");
+                    
+                    // Detectar intrusión (estado bajo en zona habilitada)
+                    if(zone_current_state == 0 && (zones_enabled & (1 << i))) {
+                        alarm_active = 1;
+                        Send_String("!Z");
+                        UART0_Write(i + '0');
+                        Send_String("\r\n");
+                    }
+                }
+            }
+        }
+    }
+}
+
+// =============== PROCESAMIENTO DE COMANDOS ===============
+void Process_Command(u8 *cmd) {
+    u8 zone;
+    u8 stable_bits;
+    u8 i;
+    
+    // Comando STATUS
+    if(cmd[0] == 'S' && cmd[1] == 0) {
+        Send_String("S ");
+        
+        // Mostrar estado ESTABLE (no crudo)
+        stable_bits = 0;
+        for(i = 0; i < 8; i++) {
+            stable_bits |= (zone_stable_state[i] << i);
+        }
+        Send_Number(stable_bits);
+        
+        Send_String(" E:");
+        Send_Number(zones_enabled);
+        Send_String(" A:");
+        Send_Number(alarm_active);
+        Send_String("\r\n");
+    }
+    // Comando RESET
+    else if(cmd[0] == 'R' && cmd[1] == 0) {
+        alarm_active = 0;
+        Send_String("R OK\r\n");
+    }
+    // Comando ENABLE n
+    else if(cmd[0] == 'E' && cmd[1] == ' ' && cmd[2] >= '0' && cmd[2] <= '7') {
+        zone = cmd[2] - '0';
+        zones_enabled |= (1 << zone);
+        Send_String("E Z");
+        UART0_Write(zone + '0');
+        Send_String("\r\n");
+    }
+    // Comando DISABLE n
+    else if(cmd[0] == 'D' && cmd[1] == ' ' && cmd[2] >= '0' && cmd[2] <= '7') {
+        zone = cmd[2] - '0';
+        zones_enabled &= ~(1 << zone);
+        Send_String("D Z");
+        UART0_Write(zone + '0');
+        Send_String("\r\n");
+    }
+    // Comando HELP
+    else if(cmd[0] == 'H' && cmd[1] == 0) {
+        Send_String("H S=Status R=Reset E n=Enable D n=Disable\r\n");
+    }
+    else {
+        Send_String("?ERR\r\n");
+    }
+}
+
+// =============== FUNCIÓN PRINCIPAL ===============
+void main(void) {
+    // Inicializar sistema
+    Init_System();
+    
+    // Mensaje de inicio
+    Send_String("\r\nALARM 8Z v2.0 (Debounce mejorado)\r\n");
+    Send_String("READY\r\n");
+    
+    // Bucle principal
+    while(1) {
+        // 1. Verificar zonas
+        Check_Zones();
+        
+        // 2. Procesar comandos UART
+        if(RI0) {
+            RI0 = 0;
+            rx_char = SBUF0;
+            
+            // Si es Enter o buffer lleno
+            if(rx_char == '\r' || rx_char == '\n' || rx_index >= 10) {
+                if(rx_index > 0) {
+                    rx_buffer[rx_index] = 0;
+                    Process_Command(rx_buffer);
+                    rx_index = 0;
+                }
+            }
+            // Carácter normal
+            else if(rx_char >= ' ' && rx_char <= '~') {
+                if(rx_index < 10) {
+                    rx_buffer[rx_index++] = rx_char;
+                }
+            }
+        }
+        
+        // 3. Delay de 1ms (controla la velocidad de muestreo)
+        Delay_1ms();
+        system_time_ms++;
+    }
+}

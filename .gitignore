@@ -1,0 +1,32 @@
+# Compilados del firmware (Keil/Silicon Labs)
+firmware_80c51f320/*.OBJ
+firmware_80c51f320/*.LST
+firmware_80c51f320/*.M51
+firmware_80c51f320/tmp.out
+firmware_80c51f320/cyglink.txt
+firmware_80c51f320/*.#*
+firmware_80c51f320/main.#*
+firmware_80c51f320/Alarma_XPort_8051F320.#*
+
+# Build del ejecutable Python
+SistemaAlarma8Zonas_PC/build/
+SistemaAlarma8Zonas_PC/dist/
+SistemaAlarma8Zonas_PC/__pycache__/
+SistemaAlarma8Zonas_PC/*.spec
+
+# Ejecutable generado
+!_Sistema de Alarma/SistemaAlarma.exe
+
+# Configuración local (usuarios, claves, historial)
+config/users.json
+config/secret.key
+config/alarm_history.csv
+config/alarm_state.json
+logs/
+
+# Archivos temporales de Claude Code
+.claude/
+
+# Windows
+Thumbs.db
+desktop.ini

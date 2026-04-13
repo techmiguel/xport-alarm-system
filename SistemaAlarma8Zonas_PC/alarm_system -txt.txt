@@ -1,0 +1,2166 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Sistema de Administración Remota para Alarmas 8 Zonas
+Versión: 2.5
+Autor: Sistema CIDT
+Requisitos: Python 3.8+, tkinter, cryptography
+"""
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+import socket
+import threading
+import queue
+import time
+import json
+import hashlib
+import os
+import csv
+from datetime import datetime
+from pathlib import Path
+import logging
+import sys
+from enum import Enum
+
+# ============================================================================
+# CONFIGURACIÓN DE RUTAS PARA .EXE Y DESARROLLO
+# ============================================================================
+
+def get_base_path():
+    """Obtiene la ruta base donde se almacenan los archivos de configuración"""
+    if getattr(sys, 'frozen', False):
+        # Si estamos ejecutando como .exe
+        base_dir = os.path.dirname(sys.executable)
+    else:
+        # Si estamos ejecutando desde el código fuente
+        base_dir = "."
+    
+    # Crear directorio de configuración si no existe
+    config_dir = os.path.join(base_dir, "config")
+    if not os.path.exists(config_dir):
+        os.makedirs(config_dir, exist_ok=True)
+    
+    # Crear directorio de logs
+    log_dir = os.path.join(base_dir, "logs")
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir, exist_ok=True)
+    
+    return base_dir, config_dir, log_dir
+
+BASE_DIR, CONFIG_DIR, LOG_DIR = get_base_path()
+
+# ============================================================================
+# CONFIGURACIÓN Y CONSTANTES
+# ============================================================================
+
+DEFAULT_PORT = 10001
+DEFAULT_IP = "192.168.143.50"
+CONFIG_FILE = os.path.join(CONFIG_DIR, "alarm_config.json")
+USERS_FILE = os.path.join(CONFIG_DIR, "users.json")
+LOG_FILE = os.path.join(LOG_DIR, "alarm_system.log")
+ALARM_HISTORY_FILE = os.path.join(CONFIG_DIR, "alarm_history.csv")
+ALARM_STATE_FILE = os.path.join(CONFIG_DIR, "alarm_state.json")
+ZONE_NAMES_FILE = os.path.join(CONFIG_DIR, "zone_names.json")
+
+# Intentar importar cryptography (opcional)
+try:
+    from cryptography.fernet import Fernet
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    CRYPTO_AVAILABLE = False
+    print("Advertencia: cryptography no está instalado. Algunas funciones de seguridad estarán limitadas.")
+    print("Instale con: pip install cryptography")
+
+# Colores para la interfaz
+COLORS = {
+    'normal': '#2E7D32',
+    'alarm': '#C62828',
+    'warning': '#F57C00',
+    'disabled': '#757575',
+    'enabled': '#4CAF50',
+    'background': '#F5F5F5',
+    'panel': '#FFFFFF',
+    'text': '#212121'
+}
+
+# ============================================================================
+# ENUMERACIONES Y CLASES DE DATOS
+# ============================================================================
+
+class AlarmState(Enum):
+    """Estados posibles del sistema de alarma"""
+    NORMAL = "SISTEMA NORMAL"
+    ACTIVE = "¡ALARMA ACTIVADA!"
+    PARTIAL = "ALARMA PARCIAL"
+    DISABLED = "SISTEMA DESHABILITADO"
+
+class AlarmEvent:
+    """Evento de alarma con toda la información"""
+    
+    def __init__(self, event_type, zone=None, state=None, enabled=None, 
+                 user=None, ip=None, zones_state=None, description=""):
+        self.timestamp = datetime.now()
+        self.event_type = event_type  # Tipo simple ahora
+        self.zone = zone
+        self.state = state
+        self.enabled = enabled
+        self.user = user
+        self.ip = ip
+        self.zones_state = zones_state or [1]*8
+        self.description = description
+        
+    def to_dict(self):
+        """Convierte el evento a diccionario para serialización"""
+        return {
+            'timestamp': self.timestamp.isoformat(),
+            'event_type': self.event_type,
+            'zone': self.zone,
+            'state': self.state,
+            'enabled': self.enabled,
+            'user': self.user,
+            'ip': self.ip,
+            'zones_state': self.zones_state,
+            'description': self.description
+        }
+    
+    @classmethod
+    def from_dict(cls, data):
+        """Crea un evento desde diccionario"""
+        event = cls(
+            event_type=data['event_type'],
+            zone=data['zone'],
+            state=data['state'],
+            enabled=data['enabled'],
+            user=data['user'],
+            ip=data['ip'],
+            zones_state=data['zones_state'],
+            description=data['description']
+        )
+        event.timestamp = datetime.fromisoformat(data['timestamp'])
+        return event
+
+# ============================================================================
+# CLASE PARA MANEJO DE NOMBRES DE ZONAS
+# ============================================================================
+
+class ZoneNamesManager:
+    """Gestor de nombres personalizados para zonas"""
+    
+    def __init__(self):
+        self.names_file = ZONE_NAMES_FILE
+        self.zone_names = self.load_zone_names()
+    
+    def load_zone_names(self):
+        """Carga los nombres de las zonas desde archivo"""
+        default_names = {
+            "0": "Zona 0",
+            "1": "Zona 1", 
+            "2": "Zona 2",
+            "3": "Zona 3",
+            "4": "Zona 4",
+            "5": "Zona 5",
+            "6": "Zona 6",
+            "7": "Zona 7"
+        }
+        
+        try:
+            if os.path.exists(self.names_file):
+                with open(self.names_file, 'r', encoding='utf-8') as f:
+                    loaded_names = json.load(f)
+                    # Asegurarse de que tenemos nombres para todas las zonas
+                    for i in range(8):
+                        if str(i) not in loaded_names:
+                            loaded_names[str(i)] = default_names[str(i)]
+                    return loaded_names
+            else:
+                # Guardar nombres por defecto
+                self.save_zone_names(default_names)
+                return default_names
+        except Exception as e:
+            print(f"Error cargando nombres de zonas: {e}")
+            return default_names
+    
+    def save_zone_names(self, names=None):
+        """Guarda los nombres de las zonas en archivo"""
+        try:
+            if names is None:
+                names = self.zone_names
+            
+            with open(self.names_file, 'w', encoding='utf-8') as f:
+                json.dump(names, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"Error guardando nombres de zonas: {e}")
+    
+    def get_zone_name(self, zone_number):
+        """Obtiene el nombre de una zona específica"""
+        return self.zone_names.get(str(zone_number), f"Zona {zone_number}")
+    
+    def set_zone_name(self, zone_number, name):
+        """Establece un nuevo nombre para una zona"""
+        self.zone_names[str(zone_number)] = name
+        self.save_zone_names()
+    
+    def reset_zone_name(self, zone_number):
+        """Restablece el nombre por defecto de una zona"""
+        default_name = f"Zona {zone_number}"
+        self.zone_names[str(zone_number)] = default_name
+        self.save_zone_names()
+        return default_name
+
+# ============================================================================
+# CLASE PARA MANEJO DE HISTORIAL Y ESTADO DE ALARMAS
+# ============================================================================
+
+class AlarmStateManager:
+    """Gestor del estado y historial de alarmas"""
+    
+    def __init__(self, security_mgr=None):
+        self.security_mgr = security_mgr
+        self.history_file = ALARM_HISTORY_FILE
+        self.state_file = ALARM_STATE_FILE
+        self.alarm_history = []
+        self.current_alarm_state = AlarmState.NORMAL
+        
+        # Cargar historial y estado previo
+        self.load_alarm_state()
+        self.load_alarm_history()
+        
+        # Inicializar con todas las alarmas habilitadas y en estado normal
+        self.zones_state = [1] * 8  # 1 = Normal, 0 = Abierta
+        self.zones_enabled = [1] * 8  # 1 = Habilitada, 0 = Deshabilitada
+        
+    def save_alarm_state(self):
+        """Guarda el estado actual de las alarmas"""
+        try:
+            state_data = {
+                'current_alarm_state': self.current_alarm_state.value,
+                'zones_state': self.zones_state,
+                'zones_enabled': self.zones_enabled,
+                'last_update': datetime.now().isoformat()
+            }
+            
+            with open(self.state_file, 'w', encoding='utf-8') as f:
+                json.dump(state_data, f, indent=2, ensure_ascii=False)
+                
+        except Exception as e:
+            print(f"Error guardando estado de alarmas: {e}")
+    
+    def load_alarm_state(self):
+        """Carga el estado anterior de las alarmas"""
+        try:
+            if os.path.exists(self.state_file):
+                with open(self.state_file, 'r', encoding='utf-8') as f:
+                    state_data = json.load(f)
+                    
+                self.current_alarm_state = AlarmState(state_data['current_alarm_state'])
+                self.zones_state = state_data.get('zones_state', [1]*8)
+                self.zones_enabled = state_data.get('zones_enabled', [1]*8)
+                
+                # Asegurar que tenemos 8 zonas
+                if len(self.zones_state) < 8:
+                    self.zones_state = (self.zones_state + [1]*(8 - len(self.zones_state)))[:8]
+                if len(self.zones_enabled) < 8:
+                    self.zones_enabled = (self.zones_enabled + [1]*(8 - len(self.zones_enabled)))[:8]
+                    
+        except Exception as e:
+            print(f"Error cargando estado de alarmas: {e}")
+            # Inicializar por defecto
+            self.zones_state = [1] * 8
+            self.zones_enabled = [1] * 8
+            self.current_alarm_state = AlarmState.NORMAL
+    
+    def save_alarm_history(self):
+        """Guarda el historial de alarmas en CSV"""
+        try:
+            # Asegurarse de que tenemos datos para guardar
+            if not self.alarm_history:
+                print("No hay historial para guardar")
+                return
+                
+            with open(self.history_file, 'w', newline='', encoding='utf-8') as csvfile:
+                fieldnames = ['timestamp', 'event_type', 'zone', 'state', 'enabled', 
+                            'user', 'ip', 'zones_state', 'description']
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                
+                writer.writeheader()
+                for event in self.alarm_history[-1000:]:  # Limitar a últimos 1000 eventos
+                    try:
+                        writer.writerow(event.to_dict())
+                    except Exception as e:
+                        print(f"Error escribiendo evento: {e}")
+                        continue
+                        
+        except Exception as e:
+            print(f"Error guardando historial de alarmas: {e}")
+    
+    def load_alarm_history(self):
+        """Carga el historial de alarmas desde CSV"""
+        try:
+            if os.path.exists(self.history_file):
+                self.alarm_history = []
+                with open(self.history_file, 'r', encoding='utf-8') as csvfile:
+                    reader = csv.DictReader(csvfile)
+                    if reader.fieldnames is None:
+                        print("Archivo de historial vacío o corrupto")
+                        return
+                        
+                    for row in reader:
+                        try:
+                            # Convertir zones_state de string a lista
+                            zones_state = [1]*8
+                            if 'zones_state' in row and row['zones_state']:
+                                try:
+                                    zones_state = json.loads(row['zones_state'])
+                                    if isinstance(zones_state, str):
+                                        zones_state = [int(c) for c in zones_state if c.isdigit()]
+                                    elif isinstance(zones_state, list):
+                                        zones_state = [int(s) for s in zones_state[:8]]
+                                except:
+                                    zones_state = [1]*8
+                            
+                            event = AlarmEvent(
+                                event_type=row.get('event_type', ''),
+                                zone=int(row['zone']) if row.get('zone') and row['zone'].strip() else None,
+                                state=int(row['state']) if row.get('state') and row['state'].strip() else None,
+                                enabled=int(row['enabled']) if row.get('enabled') and row['enabled'].strip() else None,
+                                user=row.get('user', ''),
+                                ip=row.get('ip', ''),
+                                zones_state=zones_state,
+                                description=row.get('description', '')
+                            )
+                            event.timestamp = datetime.fromisoformat(row['timestamp'])
+                            self.alarm_history.append(event)
+                        except Exception as e:
+                            print(f"Error procesando fila del historial: {e}")
+                            continue
+                            
+                print(f"Cargados {len(self.alarm_history)} eventos del historial")
+            else:
+                print("Archivo de historial no existe, se creará uno nuevo")
+                self.alarm_history = []
+                
+        except Exception as e:
+            print(f"Error cargando historial de alarmas: {e}")
+            self.alarm_history = []
+    
+    def add_alarm_event(self, event_type, zone=None, state=None, enabled=None, 
+                       description="", ip=None, zones_state=None):
+        """Agrega un evento al historial"""
+        user = self.security_mgr.current_user if self.security_mgr else None
+        zones_state = zones_state or self.zones_state.copy()
+        
+        # Usar tipos de evento simples
+        simple_event_types = {
+            "ALARM_TRIGGERED": "Alarma",
+            "ZONE_STATE_CHANGE": "Estado",
+            "ZONE_ENABLE_CHANGE": "Habilitar",
+            "USER_LOGIN": "Login",
+            "ALARM_STATE_CHANGE": "Sistema",
+            "USER_LOGOUT": "Logout",
+            "SYSTEM_SHUTDOWN": "Apagado",
+            "CONNECTION_LOST": "Conexión",
+            "AUTO_RECONNECT": "Reconexión",
+            "ZONE_NAME_CHANGE": "Nombre"
+        }
+        
+        simple_type = simple_event_types.get(event_type, event_type)
+        
+        event = AlarmEvent(
+            event_type=simple_type,
+            zone=zone,
+            state=state,
+            enabled=enabled,
+            user=user,
+            ip=ip,
+            zones_state=zones_state,
+            description=description
+        )
+        
+        self.alarm_history.append(event)
+        self.save_alarm_history()
+        
+        # Actualizar estado de zona si es relevante
+        if zone is not None and 0 <= zone <= 7:
+            if state is not None:
+                self.zones_state[zone] = state
+            if enabled is not None:
+                self.zones_enabled[zone] = enabled
+        
+        # Actualizar estado global de alarma
+        self.update_alarm_state()
+        
+        # Guardar estado actual
+        self.save_alarm_state()
+        
+        print(f"Evento agregado al historial: {simple_type} - {description}")
+        
+        return event
+    
+    def update_alarm_state(self):
+        """Actualiza el estado global de alarma basado en las zonas"""
+        # Verificar si hay al menos una zona en alarma (estado 0) y habilitada
+        any_alarm_active = False
+        
+        for i in range(8):
+            if self.zones_enabled[i] == 1 and self.zones_state[i] == 0:
+                any_alarm_active = True
+                break
+        
+        # Actualizar estado global
+        if any_alarm_active:
+            self.current_alarm_state = AlarmState.ACTIVE
+        else:
+            self.current_alarm_state = AlarmState.NORMAL
+        
+        # Registrar cambio de estado
+        if self.security_mgr:
+            self.security_mgr.log_event(
+                "ALARM_STATE_CHANGE",
+                f"Estado cambiado a: {self.current_alarm_state.value}"
+            )
+    
+    def get_alarm_state_text(self):
+        """Obtiene el texto del estado actual de alarma"""
+        return self.current_alarm_state.value
+    
+    def get_recent_events(self, limit=100):
+        """Obtiene los eventos más recientes"""
+        return self.alarm_history[-limit:] if self.alarm_history else []
+    
+    def clear_history(self):
+        """Limpia el historial de alarmas"""
+        self.alarm_history = []
+        self.save_alarm_history()
+
+# ============================================================================
+# CLASE PARA MANEJO DE CRIPTOGRAFÍA Y AUTENTICACIÓN
+# ============================================================================
+
+class SecurityManager:
+    """Gestor de seguridad, usuarios y logging"""
+    
+    def __init__(self):
+        self.users_file = USERS_FILE
+        self.crypto_enabled = CRYPTO_AVAILABLE
+        if self.crypto_enabled:
+            self.key = self._load_or_create_key()
+            self.cipher = Fernet(self.key)
+        self.logger = self._setup_logger()
+        self.current_user = None
+        
+    def _load_or_create_key(self):
+        """Carga o crea clave de cifrado"""
+        if not self.crypto_enabled:
+            return None
+            
+        key_file = os.path.join(CONFIG_DIR, "secret.key")
+        if os.path.exists(key_file):
+            with open(key_file, 'rb') as f:
+                return f.read()
+        else:
+            key = Fernet.generate_key()
+            with open(key_file, 'wb') as f:
+                f.write(key)
+            return key
+    
+    def _setup_logger(self):
+        """Configura sistema de logging"""
+        logger = logging.getLogger('AlarmSystem')
+        logger.setLevel(logging.INFO)
+        
+        # Formato del log
+        formatter = logging.Formatter(
+            '%(asctime)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        
+        # Handler para archivo
+        file_handler = logging.FileHandler(LOG_FILE)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+        
+        # Handler para consola
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+        
+        return logger
+    
+    def register_user(self, username, password, role="operator"):
+        """Registra un nuevo usuario"""
+        users = self._load_users()
+        
+        if username in users:
+            return False, "Usuario ya existe"
+        
+        # Hash de la contraseña con salt
+        salt = os.urandom(32)
+        key = hashlib.pbkdf2_hmac(
+            'sha256',
+            password.encode('utf-8'),
+            salt,
+            100000
+        )
+        
+        users[username] = {
+            'salt': salt.hex(),
+            'key': key.hex(),
+            'role': role,
+            'created': datetime.now().isoformat(),
+            'last_login': None
+        }
+        
+        self._save_users(users)
+        self.logger.info(f"Usuario registrado: {username} - Rol: {role}")
+        return True, "Usuario registrado exitosamente"
+    
+    def authenticate(self, username, password):
+        """Autentica un usuario"""
+        users = self._load_users()
+        
+        if username not in users:
+            return False, "Usuario no encontrado"
+        
+        user_data = users[username]
+        salt = bytes.fromhex(user_data['salt'])
+        stored_key = bytes.fromhex(user_data['key'])
+        
+        # Verificar contraseña
+        key = hashlib.pbkdf2_hmac(
+            'sha256',
+            password.encode('utf-8'),
+            salt,
+            100000
+        )
+        
+        if key == stored_key:
+            # Actualizar último login
+            user_data['last_login'] = datetime.now().isoformat()
+            users[username] = user_data
+            self._save_users(users)
+            
+            self.current_user = username
+            self.logger.info(f"Login exitoso: {username}")
+            return True, "Autenticación exitosa"
+        
+        self.logger.warning(f"Intento fallido de login: {username}")
+        return False, "Contraseña incorrecta"
+    
+    def is_admin(self):
+        """Verifica si el usuario actual es administrador"""
+        if not self.current_user:
+            return False
+            
+        users = self._load_users()
+        user_data = users.get(self.current_user)
+        
+        if user_data and user_data.get('role') == 'admin':
+            return True
+        return False
+    
+    def log_event(self, event_type, message, device_ip=None):
+        """Registra evento en el log"""
+        user_info = f" - Usuario: {self.current_user}" if self.current_user else ""
+        device_info = f" - Dispositivo: {device_ip}" if device_ip else ""
+        full_message = f"{event_type}: {message}{user_info}{device_info}"
+        self.logger.info(full_message)
+    
+    def _load_users(self):
+        """Carga usuarios desde archivo"""
+        if not os.path.exists(self.users_file):
+            return {}
+        
+        try:
+            with open(self.users_file, 'r', encoding='utf-8') as f:
+                if self.crypto_enabled:
+                    encrypted_data = f.read()
+                    decrypted_data = self.cipher.decrypt(encrypted_data.encode())
+                    return json.loads(decrypted_data)
+                else:
+                    return json.load(f)
+        except Exception as e:
+            print(f"Error cargando usuarios: {e}")
+            return {}
+    
+    def _save_users(self, users):
+        """Guarda usuarios en archivo"""
+        try:
+            data = json.dumps(users, indent=2, ensure_ascii=False)
+            
+            if self.crypto_enabled:
+                encrypted_data = self.cipher.encrypt(data.encode())
+                with open(self.users_file, 'wb') as f:
+                    f.write(encrypted_data)
+            else:
+                with open(self.users_file, 'w', encoding='utf-8') as f:
+                    f.write(data)
+        except Exception as e:
+            print(f"Error guardando usuarios: {e}")
+
+# ============================================================================
+# CLASE PARA COMUNICACIÓN CON DISPOSITIVO DE ALARMA
+# ============================================================================
+
+class AlarmDevice:
+    """Representa un dispositivo de alarma remoto con reconexión automática"""
+    
+    def __init__(self, ip, port=DEFAULT_PORT, security_mgr=None, alarm_state_mgr=None):
+        self.ip = ip
+        self.port = port
+        self.socket = None
+        self.connected = False
+        self.receive_thread = None
+        self.receive_queue = queue.Queue()
+        self.command_queue = queue.Queue()
+        self.security_mgr = security_mgr
+        self.alarm_state_mgr = alarm_state_mgr
+        self.status = {
+            'zones': [1]*8,  # 1=normal, 0=alarma
+            'enabled': [1]*8,  # 1=habilitada, 0=deshabilitada
+            'alarm_active': 0,
+            'raw_state': 0xFF,
+            'enabled_mask': 0xFF
+        }
+        self.last_update = None
+        self.reconnect_thread = None
+        self.auto_reconnect = True
+        self.stop_reconnect = threading.Event()
+        
+        # Cargar estado guardado para este dispositivo
+        if alarm_state_mgr:
+            self.status['zones'] = alarm_state_mgr.zones_state.copy()
+            self.status['enabled'] = alarm_state_mgr.zones_enabled.copy()
+            self.status['alarm_active'] = 1 if alarm_state_mgr.current_alarm_state == AlarmState.ACTIVE else 0
+        
+    def connect(self):
+        """Establece conexión con el dispositivo"""
+        try:
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.settimeout(5)
+            self.socket.connect((self.ip, self.port))
+            
+            # Configurar timeout para recepción
+            self.socket.settimeout(0.1)
+            
+            self.connected = True
+            self.stop_reconnect.clear()
+            
+            # Iniciar hilo de recepción
+            self.receive_thread = threading.Thread(target=self._receive_loop, daemon=True)
+            self.receive_thread.start()
+            
+            # Iniciar hilo de procesamiento de comandos
+            command_thread = threading.Thread(target=self._command_loop, daemon=True)
+            command_thread.start()
+            
+            # Iniciar hilo de verificación de conexión
+            self.reconnect_thread = threading.Thread(target=self._connection_check_loop, daemon=True)
+            self.reconnect_thread.start()
+            
+            if self.security_mgr:
+                self.security_mgr.log_event("CONEXION", f"Conectado a {self.ip}:{self.port}", self.ip)
+            
+            # Enviar estado inicial de zonas al dispositivo
+            self._sync_zones_to_device()
+            
+            return True, "Conexión exitosa"
+            
+        except socket.timeout:
+            return False, "Timeout de conexión"
+        except ConnectionRefusedError:
+            return False, "Conexión rechazada"
+        except Exception as e:
+            return False, f"Error de conexión: {str(e)}"
+    
+    def _connection_check_loop(self):
+        """Verifica periódicamente la conexión y reconecta si es necesario"""
+        while not self.stop_reconnect.is_set() and self.auto_reconnect:
+            time.sleep(2)  # Verificar cada 2 segundos
+            
+            if not self.connected:
+                try:
+                    print(f"Intentando reconexión a {self.ip}:{self.port}...")
+                    
+                    # Intentar reconectar
+                    self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    self.socket.settimeout(5)
+                    self.socket.connect((self.ip, self.port))
+                    self.socket.settimeout(0.1)
+                    
+                    self.connected = True
+                    
+                    # Reiniciar hilos
+                    self.receive_thread = threading.Thread(target=self._receive_loop, daemon=True)
+                    self.receive_thread.start()
+                    
+                    command_thread = threading.Thread(target=self._command_loop, daemon=True)
+                    command_thread.start()
+                    
+                    if self.alarm_state_mgr:
+                        self.alarm_state_mgr.add_alarm_event(
+                            event_type="AUTO_RECONNECT",
+                            description=f"Reconexión automática exitosa a {self.ip}",
+                            ip=self.ip
+                        )
+                    
+                    print(f"Reconexión exitosa a {self.ip}:{self.port}")
+                    
+                except Exception as e:
+                    print(f"Error en reconexión: {e}")
+                    if self.socket:
+                        self.socket.close()
+                        self.socket = None
+                    self.connected = False
+    
+    def _sync_zones_to_device(self):
+        """Sincroniza el estado de zonas con el dispositivo"""
+        if not self.connected:
+            return
+        
+        # Habilitar/deshabilitar zonas según el estado guardado
+        for i in range(8):
+            if self.status['enabled'][i] == 1:
+                self.command_queue.put(f"E {i}")
+            else:
+                self.command_queue.put(f"D {i}")
+    
+    def disconnect(self):
+        """Cierra la conexión"""
+        self.connected = False
+        self.auto_reconnect = False
+        self.stop_reconnect.set()
+        
+        if self.socket:
+            self.socket.close()
+            self.socket = None
+        
+        if self.security_mgr:
+            self.security_mgr.log_event("DESCONEXION", f"Desconectado de {self.ip}", self.ip)
+    
+    def send_command(self, command):
+        """Envía un comando al dispositivo"""
+        if not self.connected:
+            # Intentar reconectar automáticamente
+            if self.auto_reconnect:
+                return False, "Intentando reconectar..."
+            return False, "No conectado"
+        
+        try:
+            full_command = command + "\n"
+            self.socket.send(full_command.encode('utf-8'))
+            
+            if self.security_mgr:
+                self.security_mgr.log_event("COMANDO", f"Enviado: {command.strip()}", self.ip)
+            
+            return True, "Comando enviado"
+        except Exception as e:
+            self.connected = False
+            return False, f"Error al enviar: {str(e)}"
+    
+    def _receive_loop(self):
+        """Hilo para recibir datos del dispositivo"""
+        buffer = ""
+        
+        while self.connected and not self.stop_reconnect.is_set():
+            try:
+                data = self.socket.recv(1024)
+                if data:
+                    buffer += data.decode('utf-8', errors='ignore')
+                    
+                    # Procesar líneas completas
+                    while '\n' in buffer:
+                        line, buffer = buffer.split('\n', 1)
+                        line = line.strip()
+                        if line:
+                            self._process_received_line(line)
+                            
+            except socket.timeout:
+                continue
+            except Exception as e:
+                print(f"Error en recepción: {e}")
+                self.connected = False
+                
+                # Registrar pérdida de conexión
+                if self.alarm_state_mgr:
+                    self.alarm_state_mgr.add_alarm_event(
+                        event_type="CONNECTION_LOST",
+                        description=f"Conexión perdida con {self.ip}",
+                        ip=self.ip
+                    )
+                break
+    
+    def _process_received_line(self, line):
+        """Procesa una línea recibida del dispositivo"""
+        # Registrar evento
+        if self.security_mgr:
+            self.security_mgr.log_event("RECIBIDO", line, self.ip)
+        
+        # Procesar diferentes tipos de mensajes
+        if line.startswith("ALARM 8Z"):
+            print(f"Dispositivo: {line}")
+            
+        elif line.startswith("READY"):
+            print("Dispositivo listo")
+            
+        elif line.startswith("S "):
+            self._parse_status(line)
+            
+        elif line.startswith("Z"):
+            self._parse_zone_event(line)
+            
+        elif line.startswith("!"):
+            self._parse_alarm_event(line)
+            
+        elif line.startswith("R OK"):
+            self.status['alarm_active'] = 0
+            if self.alarm_state_mgr:
+                self.alarm_state_mgr.update_alarm_state()
+            
+        elif line.startswith("E Z") or line.startswith("D Z"):
+            self._parse_enable_disable(line)
+        
+        # Poner en cola para la interfaz
+        self.receive_queue.put(line)
+        self.last_update = datetime.now()
+    
+    def _parse_status(self, line):
+        """Parsea mensaje de estado"""
+        # Formato: S 0xFF E:0xFF A:0
+        try:
+            parts = line.split()
+            if len(parts) >= 4:
+                raw_state = int(parts[1], 16)
+                enabled_mask = int(parts[2].split(':')[1], 16)
+                alarm_active = int(parts[3].split(':')[1])
+                
+                self.status['raw_state'] = raw_state
+                self.status['enabled_mask'] = enabled_mask
+                self.status['alarm_active'] = alarm_active
+                
+                # Actualizar estado de zonas individuales
+                for i in range(8):
+                    zone_state = (raw_state >> i) & 1
+                    zone_enabled = (enabled_mask >> i) & 1
+                    self.status['zones'][i] = zone_state
+                    self.status['enabled'][i] = zone_enabled
+                
+                # Actualizar el estado de alarma
+                if self.alarm_state_mgr:
+                    # Sincronizar estado con el manager
+                    self.alarm_state_mgr.zones_state = self.status['zones'].copy()
+                    self.alarm_state_mgr.zones_enabled = self.status['enabled'].copy()
+                    self.alarm_state_mgr.update_alarm_state()
+                    
+        except Exception as e:
+            print(f"Error parseando estado: {e}")
+    
+    def _parse_zone_event(self, line):
+        """Parsea evento de zona (ej: Z3:0)"""
+        try:
+            zone = int(line[1])
+            state = int(line[3])
+            
+            if 0 <= zone <= 7:
+                old_state = self.status['zones'][zone]
+                self.status['zones'][zone] = state
+                
+                # Registrar evento de cambio de zona
+                if self.alarm_state_mgr:
+                    event_type = "ZONE_STATE_CHANGE"
+                    description = f"Zona {zone} cambió de {old_state} a {state}"
+                    self.alarm_state_mgr.add_alarm_event(
+                        event_type=event_type,
+                        zone=zone,
+                        state=state,
+                        enabled=self.status['enabled'][zone],
+                        description=description,
+                        ip=self.ip
+                    )
+                
+        except:
+            pass
+    
+    def _parse_alarm_event(self, line):
+        """Parsea evento de alarma (ej: !Z3)"""
+        try:
+            zone = int(line[2])
+            if 0 <= zone <= 7:
+                self.status['zones'][zone] = 0
+                self.status['alarm_active'] = 1
+                
+                # Registrar evento de alarma
+                if self.alarm_state_mgr:
+                    event_type = "ALARM_TRIGGERED"
+                    description = f"Alarma activada en zona {zone}"
+                    self.alarm_state_mgr.add_alarm_event(
+                        event_type=event_type,
+                        zone=zone,
+                        state=0,
+                        enabled=self.status['enabled'][zone],
+                        description=description,
+                        ip=self.ip
+                    )
+                
+        except:
+            pass
+    
+    def _parse_enable_disable(self, line):
+        """Parsea habilitación/deshabilitación de zona"""
+        try:
+            zone = int(line[3])
+            enabled = 1 if line.startswith("E") else 0
+            
+            if 0 <= zone <= 7:
+                old_enabled = self.status['enabled'][zone]
+                self.status['enabled'][zone] = enabled
+                
+                # Actualizar máscara
+                mask = 0
+                for i in range(8):
+                    if self.status['enabled'][i]:
+                        mask |= (1 << i)
+                self.status['enabled_mask'] = mask
+                
+                # Registrar evento de habilitación/deshabilitación
+                if self.alarm_state_mgr:
+                    event_type = "ZONE_ENABLE_CHANGE"
+                    description = f"Zona {zone} {'habilitada' if enabled else 'deshabilitada'}"
+                    self.alarm_state_mgr.add_alarm_event(
+                        event_type=event_type,
+                        zone=zone,
+                        state=self.status['zones'][zone],
+                        enabled=enabled,
+                        description=description,
+                        ip=self.ip
+                    )
+                
+        except:
+            pass
+    
+    def _command_loop(self):
+        """Procesa comandos en cola"""
+        while self.connected and not self.stop_reconnect.is_set():
+            try:
+                command = self.command_queue.get(timeout=0.5)
+                success, message = self.send_command(command)
+                if not success:
+                    self.receive_queue.put(f"ERROR: {message}")
+            except queue.Empty:
+                continue
+    
+    def get_zone_status(self, zone):
+        """Obtiene estado de una zona específica"""
+        if 0 <= zone <= 7:
+            return {
+                'state': self.status['zones'][zone],
+                'enabled': self.status['enabled'][zone],
+                'in_alarm': self.status['zones'][zone] == 0 and self.status['enabled'][zone] == 1
+            }
+        return None
+
+# ============================================================================
+# FUNCIONES UTILES
+# ============================================================================
+
+def center_window(window, width=None, height=None):
+    """Centra una ventana en la pantalla"""
+    window.update_idletasks()
+    
+    if width is None:
+        width = window.winfo_width()
+    if height is None:
+        height = window.winfo_height()
+    
+    x = (window.winfo_screenwidth() // 2) - (width // 2)
+    y = (window.winfo_screenheight() // 2) - (height // 2)
+    
+    window.geometry(f'{width}x{height}+{x}+{y}')
+
+# ============================================================================
+# INTERFAZ GRÁFICA - VENTANA DE LOGIN
+# ============================================================================
+
+class LoginWindow:
+    """Ventana de autenticación"""
+    
+    def __init__(self, security_mgr, alarm_state_mgr):
+        self.security_mgr = security_mgr
+        self.alarm_state_mgr = alarm_state_mgr
+        self.root = tk.Tk()
+        self.root.title("Sistema de Alarma - Autenticación")
+        self.root.geometry("400x350")
+        self.root.configure(bg=COLORS['background'])
+        
+        # Centrar ventana
+        center_window(self.root, 400, 350)
+        
+        # Evitar redimensionamiento
+        self.root.resizable(False, False)
+        
+        self.create_widgets()
+        
+    def create_widgets(self):
+        """Crea los widgets de la ventana"""
+        # Título
+        title_frame = tk.Frame(self.root, bg=COLORS['background'])
+        title_frame.pack(pady=20)
+        
+        tk.Label(
+            title_frame,
+            text="SISTEMA DE ALARMA 8 ZONAS",
+            font=('Arial', 16, 'bold'),
+            bg=COLORS['background'],
+            fg=COLORS['text']
+        ).pack()
+        
+        tk.Label(
+            title_frame,
+            text="Versión 2.5",
+            font=('Arial', 8),
+            bg=COLORS['background'],
+            fg=COLORS['disabled']
+        ).pack()
+        
+        tk.Label(
+            title_frame,
+            text="Autenticación Requerida",
+            font=('Arial', 10),
+            bg=COLORS['background'],
+            fg=COLORS['disabled']
+        ).pack(pady=(5, 0))
+        
+        # Frame de formulario
+        form_frame = tk.Frame(self.root, bg=COLORS['panel'], padx=20, pady=20)
+        form_frame.pack(pady=10)
+        
+        # Usuario
+        tk.Label(
+            form_frame,
+            text="Usuario:",
+            font=('Arial', 10),
+            bg=COLORS['panel'],
+            fg=COLORS['text']
+        ).grid(row=0, column=0, sticky='w', pady=5)
+        
+        self.username_entry = tk.Entry(form_frame, width=25, font=('Arial', 10))
+        self.username_entry.grid(row=0, column=1, pady=5, padx=(10, 0))
+        self.username_entry.focus()
+        
+        # Contraseña
+        tk.Label(
+            form_frame,
+            text="Contraseña:",
+            font=('Arial', 10),
+            bg=COLORS['panel'],
+            fg=COLORS['text']
+        ).grid(row=1, column=0, sticky='w', pady=5)
+        
+        self.password_entry = tk.Entry(form_frame, width=25, font=('Arial', 10), show='*')
+        self.password_entry.grid(row=1, column=1, pady=5, padx=(10, 0))
+        
+        # Botón de login
+        login_btn = tk.Button(
+            self.root,
+            text="INICIAR SESIÓN",
+            command=self.authenticate,
+            bg=COLORS['normal'],
+            fg='white',
+            font=('Arial', 10, 'bold'),
+            padx=20,
+            pady=5
+        )
+        login_btn.pack(pady=20)
+        
+        # Enlace para registrar nuevo usuario
+        register_btn = tk.Button(
+            self.root,
+            text="Registrar nuevo usuario",
+            command=self.open_register,
+            bg=COLORS['background'],
+            fg=COLORS['normal'],
+            font=('Arial', 9),
+            borderwidth=0
+        )
+        register_btn.pack(pady=5)
+        
+        # Información de seguridad
+        if not CRYPTO_AVAILABLE:
+            warning_frame = tk.Frame(self.root, bg='#FFF3CD', relief='groove', borderwidth=1)
+            warning_frame.pack(pady=10, padx=20, fill='x')
+            
+            tk.Label(
+                warning_frame,
+                text="⚠  Advertencia de Seguridad",
+                font=('Arial', 9, 'bold'),
+                bg='#FFF3CD',
+                fg='#856404'
+            ).pack(pady=(5, 2))
+            
+            tk.Label(
+                warning_frame,
+                text="Cryptography no está instalado.\nLos datos no se cifrarán completamente.",
+                font=('Arial', 8),
+                bg='#FFF3CD',
+                fg='#856404'
+            ).pack(pady=(0, 5))
+        
+        # Manejar tecla Enter
+        self.root.bind('<Return>', lambda e: self.authenticate())
+        
+    def authenticate(self):
+        """Realiza la autenticación"""
+        username = self.username_entry.get().strip()
+        password = self.password_entry.get()
+        
+        if not username or not password:
+            messagebox.showerror("Error", "Usuario y contraseña son requeridos")
+            return
+        
+        success, message = self.security_mgr.authenticate(username, password)
+        
+        if success:
+            # Registrar evento de login
+            self.alarm_state_mgr.add_alarm_event(
+                event_type="USER_LOGIN",
+                description=f"Usuario {username} inició sesión"
+            )
+            self.root.destroy()
+        else:
+            messagebox.showerror("Error de autenticación", message)
+            self.password_entry.delete(0, tk.END)
+    
+    def open_register(self):
+        """Abre ventana de registro"""
+        RegisterWindow(self.security_mgr, self.root)
+    
+    def run(self):
+        """Ejecuta la ventana de login"""
+        self.root.mainloop()
+
+# ============================================================================
+# INTERFAZ GRÁFICA - VENTANA DE REGISTRO
+# ============================================================================
+
+class RegisterWindow:
+    """Ventana de registro de nuevos usuarios"""
+    
+    def __init__(self, security_mgr, parent):
+        self.security_mgr = security_mgr
+        self.parent = parent
+        
+        self.window = tk.Toplevel(parent)
+        self.window.title("Registrar Nuevo Usuario")
+        self.window.geometry("400x300")
+        self.window.configure(bg=COLORS['background'])
+        self.window.transient(parent)
+        self.window.grab_set()
+        
+        # Centrar ventana
+        center_window(self.window, 400, 300)
+        
+        self.create_widgets()
+        
+    def create_widgets(self):
+        """Crea los widgets de la ventana"""
+        # Título
+        tk.Label(
+            self.window,
+            text="REGISTRO DE USUARIO",
+            font=('Arial', 14, 'bold'),
+            bg=COLORS['background'],
+            fg=COLORS['text']
+        ).pack(pady=10)
+        
+        # Frame de formulario
+        form_frame = tk.Frame(self.window, bg=COLORS['panel'], padx=20, pady=15)
+        form_frame.pack(pady=5)
+        
+        # Campos
+        fields = [
+            ("Usuario:", "username"),
+            ("Contraseña:", "password", True),
+            ("Confirmar:", "confirm", True)
+        ]
+        
+        self.entries = {}
+        
+        for i, field in enumerate(fields):
+            label_text, field_name = field[0], field[1]
+            show_char = '*' if len(field) > 2 and field[2] else ''
+            
+            tk.Label(
+                form_frame,
+                text=label_text,
+                font=('Arial', 9),
+                bg=COLORS['panel'],
+                fg=COLORS['text']
+            ).grid(row=i, column=0, sticky='w', pady=5)
+            
+            entry = tk.Entry(form_frame, width=25, font=('Arial', 10), show=show_char)
+            entry.grid(row=i, column=1, pady=5, padx=(10, 0))
+            self.entries[field_name] = entry
+        
+        # Rol (ComboBox)
+        tk.Label(
+            form_frame,
+            text="Rol:",
+            font=('Arial', 9),
+            bg=COLORS['panel'],
+            fg=COLORS['text']
+        ).grid(row=3, column=0, sticky='w', pady=5)
+        
+        self.role_var = tk.StringVar(value="operator")
+        role_combo = ttk.Combobox(
+            form_frame,
+            textvariable=self.role_var,
+            values=["operator", "admin"],
+            state="readonly",
+            width=22,
+            font=('Arial', 10)
+        )
+        role_combo.grid(row=3, column=1, pady=5, padx=(10, 0))
+        
+        # Botones
+        button_frame = tk.Frame(self.window, bg=COLORS['background'])
+        button_frame.pack(pady=10)
+        
+        tk.Button(
+            button_frame,
+            text="Registrar",
+            command=self.register,
+            bg=COLORS['normal'],
+            fg='white',
+            font=('Arial', 10),
+            padx=15
+        ).pack(side='left', padx=5)
+        
+        tk.Button(
+            button_frame,
+            text="Cancelar",
+            command=self.window.destroy,
+            bg=COLORS['disabled'],
+            fg='white',
+            font=('Arial', 10),
+            padx=15
+        ).pack(side='left', padx=5)
+        
+        # Establecer foco en primer campo
+        self.entries['username'].focus_set()
+    
+    def register(self):
+        """Registra un nuevo usuario"""
+        username = self.entries['username'].get().strip()
+        password = self.entries['password'].get()
+        confirm = self.entries['confirm'].get()
+        role = self.role_var.get()
+        
+        # Validaciones
+        if not username or not password:
+            messagebox.showerror("Error", "Todos los campos son requeridos")
+            return
+        
+        if len(username) < 3:
+            messagebox.showerror("Error", "Usuario debe tener al menos 3 caracteres")
+            return
+        
+        if password != confirm:
+            messagebox.showerror("Error", "Las contraseñas no coinciden")
+            return
+        
+        if len(password) < 6:
+            messagebox.showerror("Error", "Contraseña debe tener al menos 6 caracteres")
+            return
+        
+        # Registrar usuario
+        success, message = self.security_mgr.register_user(username, password, role)
+        
+        if success:
+            messagebox.showinfo("Éxito", message)
+            self.window.destroy()
+        else:
+            messagebox.showerror("Error", message)
+
+# ============================================================================
+# INTERFAZ GRÁFICA - VENTANA DE HISTORIAL DE ALARMAS
+# ============================================================================
+
+class AlarmHistoryWindow:
+    """Ventana para mostrar el historial de alarmas"""
+    
+    def __init__(self, parent, alarm_state_mgr, security_mgr, device_ip=None):
+        self.parent = parent
+        self.alarm_state_mgr = alarm_state_mgr
+        self.security_mgr = security_mgr
+        self.device_ip = device_ip
+        
+        self.window = tk.Toplevel(parent)
+        self.window.title("Historial de Alarmas")
+        self.window.geometry("1000x700")
+        self.window.configure(bg=COLORS['background'])
+        
+        # Centrar ventana
+        center_window(self.window, 1000, 700)
+        
+        self.create_widgets()
+        self.load_history()
+    
+    def create_widgets(self):
+        """Crea los widgets de la ventana"""
+        # Título
+        title_frame = tk.Frame(self.window, bg=COLORS['background'])
+        title_frame.pack(pady=10)
+        
+        tk.Label(
+            title_frame,
+            text="HISTORIAL DE ALARMAS",
+            font=('Arial', 16, 'bold'),
+            bg=COLORS['background'],
+            fg=COLORS['text']
+        ).pack()
+        
+        # Filtros
+        filter_frame = tk.Frame(self.window, bg=COLORS['panel'], padx=10, pady=10)
+        filter_frame.pack(fill='x', padx=10, pady=5)
+        
+        tk.Label(
+            filter_frame,
+            text="Filtrar por:",
+            font=('Arial', 9),
+            bg=COLORS['panel']
+        ).pack(side='left', padx=5)
+        
+        # Tipo de evento (simplificado)
+        self.event_type_var = tk.StringVar(value="Todos")
+        event_types = ["Todos", "Alarma", "Estado", "Habilitar", 
+                      "Login", "Sistema", "Logout", "Apagado", 
+                      "Conexión", "Reconexión", "Nombre"]
+        event_combo = ttk.Combobox(
+            filter_frame,
+            textvariable=self.event_type_var,
+            values=event_types,
+            state="readonly",
+            width=15,
+            font=('Arial', 9)
+        )
+        event_combo.pack(side='left', padx=5)
+        
+        # Zona
+        tk.Label(
+            filter_frame,
+            text="Zona:",
+            font=('Arial', 9),
+            bg=COLORS['panel']
+        ).pack(side='left', padx=(10, 5))
+        
+        self.zone_var = tk.StringVar(value="Todas")
+        zones = ["Todas"] + [str(i) for i in range(8)]
+        zone_combo = ttk.Combobox(
+            filter_frame,
+            textvariable=self.zone_var,
+            values=zones,
+            state="readonly",
+            width=10,
+            font=('Arial', 9)
+        )
+        zone_combo.pack(side='left', padx=5)
+        
+        # Botón aplicar filtro
+        tk.Button(
+            filter_frame,
+            text="Aplicar Filtro",
+            command=self.apply_filter,
+            bg=COLORS['normal'],
+            fg='white',
+            font=('Arial', 9),
+            padx=10
+        ).pack(side='left', padx=10)
+        
+        # Botón limpiar filtro
+        tk.Button(
+            filter_frame,
+            text="Limpiar Filtro",
+            command=self.clear_filter,
+            bg=COLORS['disabled'],
+            fg='white',
+            font=('Arial', 9),
+            padx=10
+        ).pack(side='left', padx=5)
+        
+        # Área de visualización con scroll
+        display_frame = tk.Frame(self.window, bg=COLORS['background'])
+        display_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        
+        # Treeview para mostrar el historial
+        columns = ('timestamp', 'event_type', 'zone', 'state', 'enabled', 
+                  'user', 'ip', 'description')
+        
+        self.tree = ttk.Treeview(
+            display_frame,
+            columns=columns,
+            show='headings',
+            height=20
+        )
+        
+        # Configurar columnas
+        column_widths = {
+            'timestamp': 150,
+            'event_type': 100,  # Más corto
+            'zone': 50,
+            'state': 50,
+            'enabled': 70,
+            'user': 80,
+            'ip': 100,
+            'description': 350
+        }
+        
+        for col in columns:
+            self.tree.heading(col, text=col.replace('_', ' ').title())
+            self.tree.column(col, width=column_widths.get(col, 100))
+        
+        # Scrollbars
+        vsb = ttk.Scrollbar(display_frame, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(display_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        
+        # Grid layout
+        self.tree.grid(column=0, row=0, sticky='nsew')
+        vsb.grid(column=1, row=0, sticky='ns')
+        hsb.grid(column=0, row=1, sticky='ew')
+        
+        display_frame.grid_columnconfigure(0, weight=1)
+        display_frame.grid_rowconfigure(0, weight=1)
+        
+        # Frame de botones inferiores
+        button_frame = tk.Frame(self.window, bg=COLORS['background'])
+        button_frame.pack(fill='x', padx=10, pady=10)
+        
+        # Botones
+        tk.Button(
+            button_frame,
+            text="Exportar a CSV",
+            command=self.export_to_csv,
+            bg=COLORS['enabled'],
+            fg='white',
+            font=('Arial', 10),
+            padx=15
+        ).pack(side='left', padx=5)
+        
+        # Botón Limpiar Historial - solo para admin
+        self.clear_history_btn = tk.Button(
+            button_frame,
+            text="Limpiar Historial",
+            command=self.clear_history,
+            bg=COLORS['warning'],
+            fg='white',
+            font=('Arial', 10),
+            padx=15,
+            state='normal' if self.security_mgr.is_admin() else 'disabled'
+        )
+        self.clear_history_btn.pack(side='left', padx=5)
+        
+        # Si no es admin, mostrar tooltip explicativo
+        if not self.security_mgr.is_admin():
+            def show_admin_tooltip(event):
+                tooltip = tk.Toplevel(self.window)
+                tooltip.wm_overrideredirect(True)
+                tooltip.wm_geometry(f"+{event.x_root+10}+{event.y_root+10}")
+                
+                label = tk.Label(tooltip, text="Solo administradores pueden limpiar el historial", 
+                            background="yellow", relief='solid', borderwidth=1)
+                label.pack()
+                
+                def hide_tooltip():
+                    tooltip.destroy()
+                
+                tooltip.after(3000, hide_tooltip)
+            
+            self.clear_history_btn.bind("<Enter>", show_admin_tooltip)
+        
+        tk.Button(
+            button_frame,
+            text="Actualizar",
+            command=self.load_history,
+            bg=COLORS['normal'],
+            fg='white',
+            font=('Arial', 10),
+            padx=15
+        ).pack(side='left', padx=5)
+        
+        tk.Button(
+            button_frame,
+            text="Cerrar",
+            command=self.window.destroy,
+            bg=COLORS['disabled'],
+            fg='white',
+            font=('Arial', 10),
+            padx=15
+        ).pack(side='right', padx=5)
+        
+        # Etiqueta de información
+        self.info_label = tk.Label(
+            button_frame,
+            text="",
+            font=('Arial', 9),
+            bg=COLORS['background'],
+            fg=COLORS['text']
+        )
+        self.info_label.pack(side='left', padx=20)
+    
+    def load_history(self, filtered=False):
+        """Carga el historial en el Treeview"""
+        # Limpiar treeview
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        
+        # Obtener eventos
+        if filtered and hasattr(self, 'filtered_events'):
+            events = self.filtered_events
+        else:
+            events = self.alarm_state_mgr.get_recent_events(limit=100)
+        
+        # Insertar eventos
+        for event in events:
+            # Formatear valores para display
+            zone_str = str(event.zone) if event.zone is not None else ""
+            
+            # Estado simplificado
+            if event.state == 0:
+                state_str = "Abierta"
+            elif event.state == 1:
+                state_str = "Normal"
+            else:
+                state_str = ""
+            
+            enabled_str = "Sí" if event.enabled == 1 else "No" if event.enabled == 0 else ""
+            
+            values = (
+                event.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                event.event_type,  # Ya es simple
+                zone_str,
+                state_str,
+                enabled_str,
+                event.user or "",
+                event.ip or "",
+                event.description
+            )
+            
+            self.tree.insert('', 'end', values=values)
+        
+        # Actualizar etiqueta de información
+        count = len(events)
+        self.info_label.config(text=f"Mostrando {count} eventos")
+    
+    def apply_filter(self):
+        """Aplica los filtros seleccionados"""
+        event_type = self.event_type_var.get()
+        zone = self.zone_var.get()
+        
+        # Obtener todos los eventos
+        all_events = self.alarm_state_mgr.get_recent_events(limit=1000)
+        filtered_events = []
+        
+        for event in all_events:
+            # Filtrar por tipo de evento
+            if event_type != "Todos" and event.event_type != event_type:
+                continue
+            
+            # Filtrar por zona
+            if zone != "Todas":
+                if event.zone is None:
+                    continue
+                if str(event.zone) != zone:
+                    continue
+            
+            filtered_events.append(event)
+        
+        # Guardar eventos filtrados y cargarlos
+        self.filtered_events = filtered_events
+        self.load_history(filtered=True)
+    
+    def clear_filter(self):
+        """Limpia los filtros"""
+        self.event_type_var.set("Todos")
+        self.zone_var.set("Todas")
+        self.load_history()
+    
+    def export_to_csv(self):
+        """Exporta el historial a CSV"""
+        try:
+            filename = f"alarm_history_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            
+            events = self.alarm_state_mgr.get_recent_events(limit=1000)
+            
+            with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+                fieldnames = ['timestamp', 'event_type', 'zone', 'state', 
+                            'enabled', 'user', 'ip', 'description']
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                
+                writer.writeheader()
+                for event in events:
+                    writer.writerow({
+                        'timestamp': event.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                        'event_type': event.event_type,
+                        'zone': event.zone if event.zone is not None else "",
+                        'state': event.state if event.state is not None else "",
+                        'enabled': event.enabled if event.enabled is not None else "",
+                        'user': event.user or "",
+                        'ip': event.ip or "",
+                        'description': event.description
+                    })
+            
+            messagebox.showinfo("Éxito", f"Historial exportado a {filename}")
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo exportar: {str(e)}")
+    
+    def clear_history(self):
+        """Limpia el historial de alarmas - solo para admin"""
+        if not self.security_mgr.is_admin():
+            messagebox.showerror("Acceso Denegado", "Solo los administradores pueden limpiar el historial.")
+            return
+            
+        if messagebox.askyesno("Confirmar", "¿Está seguro de que desea borrar todo el historial?"):
+            self.alarm_state_mgr.clear_history()
+            self.load_history()
+            messagebox.showinfo("Éxito", "Historial limpiado correctamente")
+
+# ============================================================================
+# INTERFAZ GRÁFICA - VENTANA PRINCIPAL
+# ============================================================================
+
+class MainWindow:
+    """Ventana principal de la aplicación"""
+    
+    def __init__(self, security_mgr, alarm_state_mgr):
+        self.security_mgr = security_mgr
+        self.alarm_state_mgr = alarm_state_mgr
+        self.zone_names_mgr = ZoneNamesManager()
+        self.devices = {}
+        self.current_device = None
+        
+        self.root = tk.Tk()
+        self.root.title(f"Sistema de Alarma 8 Zonas - Usuario: {security_mgr.current_user}")
+        self.root.geometry("1000x550")  # REDUCIDO VERTICALMENTE
+        self.root.configure(bg=COLORS['background'])
+        
+        # Configurar icono (si existe)
+        icon_path = os.path.join(BASE_DIR, "alarm_icon.ico")
+        if os.path.exists(icon_path):
+            try:
+                self.root.iconbitmap(icon_path)
+            except:
+                pass
+        
+        # Configurar protocolo de cierre
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
+        # Centrar ventana
+        center_window(self.root, 1000, 550)
+        
+        self.create_widgets()
+        self.start_update_loop()
+        
+    def create_widgets(self):
+        """Crea todos los widgets de la interfaz"""
+        # Frame superior - Barra de herramientas
+        toolbar_frame = tk.Frame(self.root, bg=COLORS['panel'], height=50)  # NORMAL
+        toolbar_frame.pack(fill='x', padx=10, pady=5)
+        toolbar_frame.pack_propagate(False)
+        
+        # Botón conectar/desconectar
+        self.connect_btn = tk.Button(
+            toolbar_frame,
+            text="CONECTAR DISPOSITIVO",
+            command=self.toggle_connection,
+            bg=COLORS['normal'],
+            fg='white',
+            font=('Arial', 10, 'bold'),
+            padx=15,
+            pady=4  # NORMAL
+        )
+        self.connect_btn.pack(side='left', padx=10)
+        
+        # Entrada de IP con valor por defecto 192.168.143.50
+        tk.Label(
+            toolbar_frame,
+            text="IP del Dispositivo:",
+            bg=COLORS['panel'],
+            font=('Arial', 9)
+        ).pack(side='left', padx=(20, 5))
+        
+        self.ip_entry = tk.Entry(toolbar_frame, width=20, font=('Arial', 10))
+        self.ip_entry.pack(side='left', padx=5)
+        self.ip_entry.insert(0, DEFAULT_IP)
+        
+        # Puerto
+        tk.Label(
+            toolbar_frame,
+            text="Puerto:",
+            bg=COLORS['panel'],
+            font=('Arial', 9)
+        ).pack(side='left', padx=(10, 5))
+        
+        self.port_entry = tk.Entry(toolbar_frame, width=8, font=('Arial', 10))
+        self.port_entry.pack(side='left', padx=5)
+        self.port_entry.insert(0, str(DEFAULT_PORT))
+        
+        # Estado de conexión
+        self.connection_status = tk.Label(
+            toolbar_frame,
+            text="Desconectado",
+            bg=COLORS['panel'],
+            fg=COLORS['disabled'],
+            font=('Arial', 9, 'bold')
+        )
+        self.connection_status.pack(side='left', padx=20)
+        
+        # Botón para ver historial de alarmas
+        history_btn = tk.Button(
+            toolbar_frame,
+            text="VER HISTORIAL",
+            command=self.show_alarm_history,
+            bg=COLORS['normal'],
+            fg='white',
+            font=('Arial', 9, 'bold'),
+            padx=10,
+            pady=4  # NORMAL
+        )
+        history_btn.pack(side='right', padx=5)
+        
+        # Información de usuario
+        user_label = tk.Label(
+            toolbar_frame,
+            text=f"Usuario: {self.security_mgr.current_user}",
+            bg=COLORS['panel'],
+            font=('Arial', 9),
+            fg=COLORS['normal']
+        )
+        user_label.pack(side='right', padx=5)
+        
+        # Botón logout - TAMAÑO NORMAL
+        logout_btn = tk.Button(
+            toolbar_frame,
+            text="Logout",
+            command=self.logout,
+            bg=COLORS['warning'],
+            fg='white',
+            font=('Arial', 9),  # NORMAL, no bold
+            padx=10,  # NORMAL
+            pady=4    # NORMAL
+        )
+        logout_btn.pack(side='right', padx=10)
+        
+        # Frame principal - Solo panel izquierdo ahora
+        main_frame = tk.Frame(self.root, bg=COLORS['panel'])
+        main_frame.pack(fill='both', expand=True, padx=10, pady=(0, 10))
+        
+        # ============ PANEL DE ZONAS ============
+        
+        # Título del panel
+        tk.Label(
+            main_frame,
+            text="ESTADO DE ZONAS",
+            font=('Arial', 14, 'bold'),
+            bg=COLORS['panel'],
+            fg=COLORS['text']
+        ).pack(pady=10)
+        
+        # Frame para las zonas (2x4)
+        zones_frame = tk.Frame(main_frame, bg=COLORS['panel'])
+        zones_frame.pack(pady=5, padx=20)  # REDUCIDO VERTICALMENTE
+        
+        self.zone_widgets = []
+        for i in range(8):
+            zone_frame = tk.Frame(zones_frame, bg='white', relief='ridge', borderwidth=2)
+            row = i // 4
+            col = i % 4
+            zone_frame.grid(row=row, column=col, padx=10, pady=10, sticky='nsew')
+            
+            # Título de la zona con nombre personalizable
+            zone_title_label = tk.Label(
+                zone_frame,
+                text=self.zone_names_mgr.get_zone_name(i),
+                font=('Arial', 10, 'bold'),
+                bg='white',
+                cursor="hand2"
+            )
+            zone_title_label.pack(pady=5)
+            
+            # Hacer el título clickeable para editar
+            zone_title_label.bind("<Button-1>", lambda e, z=i, lbl=zone_title_label: self.edit_zone_name(z, lbl))
+            
+            # Estado
+            state_label = tk.Label(
+                zone_frame,
+                text="NORMAL",
+                font=('Arial', 12, 'bold'),
+                bg='white',
+                fg=COLORS['normal']
+            )
+            state_label.pack(pady=2)
+            
+            # Habilitado/Deshabilitado
+            enabled_label = tk.Label(
+                zone_frame,
+                text="HABILITADA",
+                font=('Arial', 9),
+                bg='white',
+                fg=COLORS['enabled']
+            )
+            enabled_label.pack(pady=2)
+            
+            # Botones de control
+            btn_frame = tk.Frame(zone_frame, bg='white')
+            btn_frame.pack(pady=5)
+            
+            enable_btn = tk.Button(
+                btn_frame,
+                text="Habilitar",
+                command=lambda z=i: self.enable_zone(z),
+                bg=COLORS['enabled'],
+                fg='white',
+                font=('Arial', 8),
+                width=8
+            )
+            enable_btn.pack(side='left', padx=2)
+            
+            disable_btn = tk.Button(
+                btn_frame,
+                text="Deshabilitar",
+                command=lambda z=i: self.disable_zone(z),
+                bg=COLORS['disabled'],
+                fg='white',
+                font=('Arial', 8),
+                width=8
+            )
+            disable_btn.pack(side='left', padx=2)
+            
+            self.zone_widgets.append({
+                'frame': zone_frame,
+                'title_label': zone_title_label,
+                'state_label': state_label,
+                'enabled_label': enabled_label,
+                'enable_btn': enable_btn,
+                'disable_btn': disable_btn
+            })
+        
+        # Configurar pesos de grid
+        for i in range(4):
+            zones_frame.columnconfigure(i, weight=1)
+            zones_frame.rowconfigure(i, weight=1)
+    
+    def edit_zone_name(self, zone, label_widget):
+        """Abre una ventana para editar el nombre de la zona"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"Editar nombre de Zona {zone}")
+        dialog.geometry("400x200")
+        dialog.configure(bg=COLORS['background'])
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        center_window(dialog, 400, 200)
+        
+        tk.Label(
+            dialog,
+            text=f"Nombre actual: {self.zone_names_mgr.get_zone_name(zone)}",
+            bg=COLORS['background'],
+            font=('Arial', 10)
+        ).pack(pady=10)
+        
+        tk.Label(
+            dialog,
+            text="Nuevo nombre:",
+            bg=COLORS['background'],
+            font=('Arial', 10)
+        ).pack(pady=5)
+        
+        name_var = tk.StringVar(value=self.zone_names_mgr.get_zone_name(zone))
+        entry = tk.Entry(dialog, textvariable=name_var, font=('Arial', 12))
+        entry.pack(pady=10, padx=50, fill='x')
+        entry.select_range(0, tk.END)
+        entry.focus()
+        
+        button_frame = tk.Frame(dialog, bg=COLORS['background'])
+        button_frame.pack(pady=10)
+        
+        def save():
+            new_name = name_var.get().strip()
+            if new_name:
+                self.zone_names_mgr.set_zone_name(zone, new_name)
+                label_widget.config(text=new_name)
+                
+                # Registrar evento
+                self.alarm_state_mgr.add_alarm_event(
+                    event_type="ZONE_NAME_CHANGE",
+                    zone=zone,
+                    description=f"Nombre cambiado a: {new_name}"
+                )
+                
+                dialog.destroy()
+        
+        def reset():
+            default_name = self.zone_names_mgr.reset_zone_name(zone)
+            label_widget.config(text=default_name)
+            name_var.set(default_name)
+            
+            # Registrar evento
+            self.alarm_state_mgr.add_alarm_event(
+                event_type="ZONE_NAME_CHANGE",
+                zone=zone,
+                description=f"Nombre restablecido a: {default_name}"
+            )
+        
+        tk.Button(
+            button_frame,
+            text="Guardar",
+            command=save,
+            bg=COLORS['normal'],
+            fg='white',
+            font=('Arial', 10),
+            padx=15
+        ).pack(side='left', padx=5)
+        
+        tk.Button(
+            button_frame,
+            text="Restablecer",
+            command=reset,
+            bg=COLORS['warning'],
+            fg='white',
+            font=('Arial', 10),
+            padx=15
+        ).pack(side='left', padx=5)
+        
+        tk.Button(
+            button_frame,
+            text="Cancelar",
+            command=dialog.destroy,
+            bg=COLORS['disabled'],
+            fg='white',
+            font=('Arial', 10),
+            padx=15
+        ).pack(side='left', padx=5)
+        
+        dialog.bind('<Return>', lambda e: save())
+        dialog.bind('<Escape>', lambda e: dialog.destroy())
+    
+    def show_alarm_history(self):
+        """Muestra la ventana de historial de alarmas"""
+        device_ip = self.current_device.ip if self.current_device else None
+        AlarmHistoryWindow(self.root, self.alarm_state_mgr, self.security_mgr, device_ip)
+    
+    def toggle_connection(self):
+        """Conecta o desconecta del dispositivo"""
+        if self.current_device and self.current_device.connected:
+            # Desconectar
+            self.current_device.disconnect()
+            self.current_device = None
+            self.update_connection_status(False)
+        else:
+            # Conectar
+            ip = self.ip_entry.get().strip()
+            port = self.port_entry.get().strip()
+            
+            if not ip:
+                messagebox.showerror("Error", "Debe especificar una dirección IP")
+                return
+            
+            try:
+                port = int(port)
+            except ValueError:
+                messagebox.showerror("Error", "Puerto inválido")
+                return
+            
+            # Crear dispositivo
+            device = AlarmDevice(ip, port, self.security_mgr, self.alarm_state_mgr)
+            success, message = device.connect()
+            
+            if success:
+                self.current_device = device
+                self.devices[ip] = device
+                self.update_connection_status(True)
+                self.send_command("S")  # Solicitar estado inicial
+            else:
+                messagebox.showerror("Error de conexión", message)
+    
+    def update_connection_status(self, connected):
+        """Actualiza la UI según estado de conexión"""
+        if connected:
+            self.connect_btn.config(
+                text="DESCONECTAR",
+                bg=COLORS['warning']
+            )
+            self.connection_status.config(
+                text="Conectado",
+                fg=COLORS['normal']
+            )
+        else:
+            self.connect_btn.config(
+                text="CONECTAR DISPOSITIVO",
+                bg=COLORS['normal']
+            )
+            self.connection_status.config(
+                text="Desconectado",
+                fg=COLORS['disabled']
+            )
+    
+    def send_command(self, command):
+        """Envía un comando al dispositivo actual"""
+        if not self.current_device or not self.current_device.connected:
+            messagebox.showwarning("Advertencia", "No hay dispositivo conectado")
+            return
+        
+        self.current_device.command_queue.put(command)
+    
+    def enable_zone(self, zone):
+        """Habilita una zona específica"""
+        self.send_command(f"E {zone}")
+        
+        # Registrar evento localmente
+        self.alarm_state_mgr.add_alarm_event(
+            event_type="ZONE_ENABLE_CHANGE",
+            zone=zone,
+            enabled=1,
+            description=f"Zona {zone} habilitada manualmente"
+        )
+    
+    def disable_zone(self, zone):
+        """Deshabilita una zona específica"""
+        self.send_command(f"D {zone}")
+        
+        # Registrar evento localmente
+        self.alarm_state_mgr.add_alarm_event(
+            event_type="ZONE_ENABLE_CHANGE",
+            zone=zone,
+            enabled=0,
+            description=f"Zona {zone} deshabilitada manualmente"
+        )
+    
+    def update_ui_from_device(self):
+        """Actualiza la UI con el estado del dispositivo"""
+        if not self.current_device or not self.current_device.connected:
+            return
+        
+        # Procesar mensajes recibidos
+        while not self.current_device.receive_queue.empty():
+            try:
+                self.current_device.receive_queue.get_nowait()
+            except queue.Empty:
+                break
+        
+        # Actualizar estado de zonas
+        for i in range(8):
+            status = self.current_device.get_zone_status(i)
+            if status:
+                widget = self.zone_widgets[i]
+                
+                # Actualizar estado
+                if status['in_alarm']:
+                    widget['state_label'].config(
+                        text="ABIERTA",
+                        fg=COLORS['alarm']
+                    )
+                    widget['frame'].config(bg='#FFCDD2')  # Rojo claro
+                else:
+                    state_text = "NORMAL" if status['state'] == 1 else "ABIERTA"
+                    color = COLORS['normal'] if status['state'] == 1 else COLORS['warning']
+                    widget['state_label'].config(
+                        text=state_text,
+                        fg=color
+                    )
+                    widget['frame'].config(bg='white')
+                
+                # Actualizar habilitación
+                if status['enabled']:
+                    widget['enabled_label'].config(
+                        text="HABILITADA",
+                        fg=COLORS['enabled']
+                    )
+                else:
+                    widget['enabled_label'].config(
+                        text="DESHABILITADA",
+                        fg=COLORS['disabled']
+                    )
+    
+    def start_update_loop(self):
+        """Inicia el loop de actualización de UI"""
+        self.update_ui_from_device()
+        self.root.after(100, self.start_update_loop)
+    
+    def logout(self):
+        """Cierra sesión y vuelve al login"""
+        if self.current_device and self.current_device.connected:
+            self.current_device.disconnect()
+        
+        # Registrar evento de logout
+        self.alarm_state_mgr.add_alarm_event(
+            event_type="USER_LOGOUT",
+            description=f"Usuario {self.security_mgr.current_user} cerró sesión"
+        )
+        
+        self.security_mgr.current_user = None
+        self.root.destroy()
+        
+        # Reiniciar aplicación
+        security_mgr = SecurityManager()
+        alarm_state_mgr = AlarmStateManager(security_mgr)
+        login = LoginWindow(security_mgr, alarm_state_mgr)
+        login.run()
+    
+    def on_closing(self):
+        """Maneja el cierre de la ventana"""
+        if messagebox.askokcancel("Salir", "¿Está seguro de que desea salir?"):
+            if self.current_device and self.current_device.connected:
+                self.current_device.disconnect()
+            
+            # Registrar evento de cierre
+            self.alarm_state_mgr.add_alarm_event(
+                event_type="SYSTEM_SHUTDOWN",
+                description="Aplicación cerrada"
+            )
+            
+            self.security_mgr.log_event("SISTEMA", "Aplicación cerrada")
+            self.root.destroy()
+            sys.exit(0)
+
+# ============================================================================
+# FUNCIÓN PRINCIPAL
+# ============================================================================
+
+def main():
+    """Función principal de la aplicación"""
+    
+    print("=" * 60)
+    print("SISTEMA DE ADMINISTRACIÓN DE ALARMAS 8 ZONAS")
+    print("Versión: 2.5 - Compatible con .exe")
+    print("=" * 60)
+    
+    # Verificar si hay usuarios registrados
+    security_mgr = SecurityManager()
+    alarm_state_mgr = AlarmStateManager(security_mgr)
+    
+    users = security_mgr._load_users()
+    if not users:
+        print("\nNo hay usuarios registrados. Creando usuario administrador por defecto...")
+        success, message = security_mgr.register_user("admin", "admin123", "admin")
+        if success:
+            print(f"Usuario creado: admin / admin123")
+            print("NOTA: Cambie la contraseña después del primer login.")
+        else:
+            print(f"Error al crear usuario: {message}")
+            sys.exit(1)
+    
+    # Iniciar interfaz de login
+    login = LoginWindow(security_mgr, alarm_state_mgr)
+    login.run()
+    
+    # Si el login fue exitoso, iniciar ventana principal
+    if security_mgr.current_user:
+        app = MainWindow(security_mgr, alarm_state_mgr)
+        app.root.mainloop()
+
+# ============================================================================
+# PUNTO DE ENTRADA
+# ============================================================================
+
+if __name__ == "__main__":
+    main()
